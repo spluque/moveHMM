@@ -7,7 +7,6 @@ customized with Pandas/Matplotlib.
 import numpy as np
 import pandas as pd
 import scipy.stats as scistats
-import numdifftools as ndt
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import matplotlib.dates as mdates
@@ -302,146 +301,62 @@ def plot_trprobs(x, covariate_name, state_labels=None, xlabel=None,
     Returns
     -------
     fig : Figure
-    ax : Axes
+    axs : Axes
 
     """
     fit_dict = parse_fit(x)
     step_pars = fit_dict["mle"]["stepPar"]
-    angle_pars = fit_dict["mle"]["anglePar"]
     n_states = step_pars.shape[1]
     beta = fit_dict["mle"]["beta"]
-    hessian = fit_dict["mod"]["hessian"]
-    if fit_dict["conditions"]["zeroInflation"][0]:
-        step_pars = np.delete(step_pars, -1, 0)
+    if fit_dict["conditions"]["zeroInflation"]:
+        step_pars.drop(step_pars.index[-1], inplace=True)
     if state_labels is None:
         state_labels = list(map(str, np.arange(1, n_states + 1)))
 
     if beta.shape[0] > 1:
-        raw_covs = fit_dict["rawCovs"]
-        grid_len = 100
+        # raw_covs = fit_dict["rawCovs"]
+        tpm = moveHMM.getPlotData(x, type="tpm", format="wide")
+        tpm_d = dict(zip(tpm.names, list(tpm)))
+        with cv.localconverter(robjs.default_converter + pandas2ri.converter):
+            tpm = cv.rpy2py(tpm_d[covariate_name])
 
-        with cv.localconverter(robjs.default_converter +
-                               numpy2ri.converter):
-            if hessian is not None:
-                sigma = np.array(robjs.r("ginv")(hessian))
-            else:
-                plot_ci = False
-
-        i0 = (step_pars.size + angle_pars.size -
-              (~np.ma.make_mask(
-                  fit_dict["conditions"]["estAngleMean"][0]) *
-               n_states))
-        i1 = i0 + beta.size     # Python 0-based
-        gam_idx = slice(i0, i1)
-        q_up = scistats.norm.ppf(1 - (1 - q_ci) / 2)
-
-        covs_min = raw_covs.min()
-        covs_max = raw_covs.max()
-        # DataFrame with mean value for each covariate
-        covs_mean = pd.concat([raw_covs.mean().to_frame().transpose()] *
-                              grid_len, ignore_index=True)
-
+        fig = plt.figure(**kwargs)
+        axs = list()
+        # Loop over columns in transition probability matrix
         states_prod = np.transpose(np.meshgrid(state_labels,
                                                state_labels, indexing="ij"),
-                                   (1, 2, 0))
-        dummy = covs_mean.copy()
-        cov_grid = np.linspace(covs_min.loc[covariate_name],
-                               covs_max.loc[covariate_name],
-                               num=grid_len)
-        dummy.loc[:, covariate_name] = cov_grid
-        with cv.localconverter(robjs.default_converter +
-                               pandas2ri.converter):
-            des_mat = (r_stats
-                       .model_matrix(fit_dict["conditions"]["formula"],
-                                     data=dummy))
-        with cv.localconverter(robjs.default_converter +
-                               numpy2ri.converter):
-            trans_mat = np.array(moveHMM.trMatrix_rcpp(n_states, beta,
-                                                       des_mat))
+                                   (1, 2, 0)).reshape((-1, 2))
+        tpm_hat = tpm.iloc[:, 1:(n_states ** 2) + 1]
+        for ax_idx, (probs_lab, probs) in enumerate(tpm_hat.items()):
+            ax = fig.add_subplot(n_states, n_states, ax_idx + 1)
+            ax.plot(tpm[covariate_name], probs)
+            ax.set_ylim(-0.01, 1.01)
+            ax.set_ylabel("P({} -> {})".format(*states_prod[ax_idx]))
+            if xlabel is None:
+                ax.set_xlabel(covariate_name)
+            else:
+                ax.set_xlabel(xlabel)
 
-        # Set up plot
-        fig, axs = plt.subplots(n_states, n_states, sharex=True,
-                                sharey=True, **kwargs)
-        # Loop over entries in transition probability matrix
-        trans_zipped = zip(states_prod, trans_mat)
-        for ax_idx, trans_data in enumerate(trans_zipped):
-            state_prod, trans_mati = trans_data
-            axs_i = axs[ax_idx]
+            if plot_ci:
+                lci = tpm.iloc[:, 1 + ax_idx + n_states ** 2]
+                uci = tpm.iloc[:, 1 + ax_idx + n_states ** 2 * 2]
+                yerr = np.vstack((probs - lci, uci - probs))
+                ax.errorbar(tpm[covariate_name], probs, yerr=yerr,
+                            fmt="none", linewidth=1, ecolor="gray")
 
-            for idx, trans_p in enumerate(trans_mati):
-                axs_i[idx].plot(dummy[covariate_name], trans_p)
-                axs_i[idx].set_ylim(-0.01, 1.01)
-                axs_i[idx].set_ylabel("P({} -> {})"
-                                      .format(*state_prod[idx]))
-                if xlabel is None:
-                    axs_i[idx].set_xlabel(covariate_name)
-                else:
-                    axs_i[idx].set_xlabel(xlabel)
+            axs.append(ax)
 
-                if plot_ci:
-                    beta_shp = beta.shape
-
-                    def _pick_gamma(x, cov_curr, fro, to):
-                        # Pick gamma at current covariate values, returning
-                        # scalar for computing gradient.
-                        beta = np.reshape(x, beta_shp)
-                        gamma_curr = _gamma(beta, np.array([cov_curr]),
-                                            n_states)
-                        return gamma_curr[fro, to, 0]
-
-                    dfun = ndt.Gradient(_pick_gamma)
-
-                    def _dfun1(x):
-                        return np.reshape(dfun(beta, x, ax_idx, idx),
-                                          beta_shp).T.ravel()
-
-                    # grad = dfun(beta, des_mat[idx], ax_idx, idx)
-                    dN = np.apply_along_axis(_dfun1, 1, des_mat)
-
-                    def _sefun(x):
-                        return np.sqrt(np.matmul(
-                            np.matmul(x, sigma[gam_idx, gam_idx]),
-                            x))
-
-                    se = np.apply_along_axis(_sefun, 1, dN)
-
-                    lci = scistats.logistic.cdf(
-                        scistats.logistic.ppf(trans_mat[ax_idx, idx, :]) -
-                        q_up * se / (trans_mat[ax_idx, idx, :] -
-                                     trans_mat[ax_idx, idx, :] ** 2))
-                    uci = scistats.logistic.cdf(
-                        scistats.logistic.ppf(trans_mat[ax_idx, idx, :]) +
-                        q_up * se / (trans_mat[ax_idx, idx, :] -
-                                     trans_mat[ax_idx, idx, :] ** 2))
-                    # yerr = trans_p - uci
-                    yerr = np.vstack((trans_p - lci, uci - trans_p))
-
-                    axs_i[idx].errorbar(dummy[covariate_name], trans_p,
-                                        yerr=yerr, fmt="none", linewidth=1,
-                                        ecolor="gray")
+        axs = np.array(axs).reshape((n_states, n_states))
+        # Share x and y axes
+        for ax in axs[0]:
+            ax.get_shared_x_axes().join(*axs.flatten())
+            ax.set_xticklabels([])
+            ax.set_xlabel("")
+        for ax in axs[:, 1:].flatten():
+            ax.get_shared_y_axes().join(*axs.flatten())
+            ax.set_yticklabels([])
 
         return fig, axs
-
-
-def _gamma(beta, covariates, n_states):
-    """
-
-    Parameters
-    ----------
-    beta :
-    covariates :
-    n_states :
-
-    Returns
-    -------
-    ndarray
-
-    """
-    with cv.localconverter(robjs.default_converter + numpy2ri.converter):
-        gamma = np.array(moveHMM.trMatrix_rcpp(n_states, beta,
-                                               covariates))
-
-    return gamma
 
 
 def plot_states(x, ID, state_labels=None,
