@@ -19,11 +19,13 @@ from rpy2.robjects import pandas2ri, numpy2ri
 from rpy2.robjects.packages import importr
 
 # Initialize R instance
-moveHMM = importr("moveHMM")
 r_stats = importr("stats")
+r_base = importr("base")
+moveHMM = importr("moveHMM")
 
 
-def prep_data(xy_df, id_col=None, coordNames=["longitude", "latitude"]):
+def prep_data(xy_df, id_col=None, coordNames=["longitude", "latitude"],
+              **kwargs):
     """Interface to moveHMM prepData
 
     Parameters
@@ -42,16 +44,14 @@ def prep_data(xy_df, id_col=None, coordNames=["longitude", "latitude"]):
       Output DataFrame as returned by prepData.
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           pandas2ri.converter):
-        coordNames = pd.Series(["longitude", "latitude"])
+    with cv.localconverter(robjs.default_converter + pandas2ri.converter):
+        coordNames = pd.Series(coordNames)
 
         if id_col is not None:
             xy_df = xy_df.copy()
             xy_df.rename(columns={id_col: "ID"}, inplace=True)
 
-        move_data = moveHMM.prepData(xy_df, type="LL",
-                                     coordNames=coordNames)
+        move_data = moveHMM.prepData(xy_df, coordNames=coordNames, **kwargs)
 
     return move_data
 
@@ -65,25 +65,29 @@ def fit_HMM(xy_md, nbStates, stepPar0, anglePar0, **kwargs):
       DataFrame complying with moveData structure.
     nbStates : int
       Number of states in the model.
-    stepPar0 : array_like
+    stepPar0 : pandas.Series
       Initial values for step parameter search.
-    anglePar0 : array_like
+    anglePar0 : pandas.Series
       Initial values for angle parameter search.
     **kwargs : optional keyword arguments
+      Arguments passed to R fitHMM.
 
     Returns
     -------
     md_fit : moveHMM (R class)
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           pandas2ri.converter):
+    with cv.localconverter(robjs.default_converter + pandas2ri.converter):
         # Set input prepared data as R object as it has be to a data.frame
         # AND moveData R object to be taken by fitHMM
-        md = robjs.conversion.py2rpy(xy_md)
+        md = cv.py2rpy(xy_md)
         md.rclass = robjs.StrVector(("data.frame", "moveData"))
-        md_fit = moveHMM.fitHMM(md, nbStates=nbStates, stepPar0=stepPar0,
-                                anglePar0=anglePar0, **kwargs)
+        # Convert objects to R
+        stepPar0_r = cv.py2rpy(stepPar0)
+        anglePar0_r = cv.py2rpy(anglePar0)
+
+    md_fit = moveHMM.fitHMM(md, nbStates=nbStates, stepPar0=stepPar0_r,
+                            anglePar0=anglePar0_r, **kwargs)
 
     return md_fit
 
@@ -102,8 +106,7 @@ def AIC(*args):
       AIC values for each model
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           pandas2ri.converter):
+    with cv.localconverter(robjs.default_converter + pandas2ri.converter):
         AIC = r_stats.AIC(*args)
 
     return AIC
@@ -116,16 +119,37 @@ def parse_fit(x):
     ----------
     x : moveHMM (R class)
       HMM fit
+
     Returns
     -------
     dict
 
     """
+    fit_dict = dict(zip(x.names, list(x)))
+
+    for key in ["mle", "mod", "conditions"]:
+        fit_dict[key] = dict(zip(fit_dict[key].names,
+                                 list(fit_dict[key])))
+        if key == "mle":
+            fit_dict[key]["delta"] = np.array(fit_dict[key]["delta"])
+        elif key == "mod":
+            fit_dict[key]["minimum"] = fit_dict[key]["minimum"][0]
+            for subkey in ["estimate", "gradient", "hessian"]:
+                fit_dict[key][subkey] = np.array(fit_dict[key][subkey])
+            for subkey in ["code", "iterations"]:
+                fit_dict[key][subkey] = fit_dict[key][subkey][0]
+        else:
+            conditions_keys = fit_dict[key].keys()
+            for subkey in [k for k in conditions_keys if k != "formula"]:
+                fit_dict[key][subkey] = fit_dict[key][subkey][0]
+
     with cv.localconverter(robjs.default_converter + pandas2ri.converter):
-        fit_dict = dict(zip(x.names, list(x)))
-        for key in ["mle", "mod", "conditions"]:
-            fit_dict[key] = dict(zip(fit_dict[key].names,
-                                     list(fit_dict[key])))
+        fit_dict["data"] = cv.rpy2py(fit_dict["data"])
+        fit_dict["rawCovs"] = cv.rpy2py(fit_dict["rawCovs"])
+        fit_dict["knownStates"] = cv.rpy2py(fit_dict["knownStates"])
+        fit_dict["nlmTime"] = cv.rpy2py(fit_dict["nlmTime"])
+        for key in ["stepPar", "anglePar", "beta"]:
+            fit_dict["mle"][key] = r_base.as_data_frame(fit_dict["mle"][key])
 
     return fit_dict
 
@@ -161,12 +185,12 @@ def plot_fit_hist(x, state_labels, **kwargs):
     step_pars = fit_dict["mle"]["stepPar"]
     n_states = step_pars.shape[1]
     angle_pars = fit_dict["mle"]["anglePar"]
-    if fit_dict["conditions"]["zeroInflation"][0]:
-        zero_mass = step_pars[-1]
-        step_pars = np.delete(step_pars, -1, 0)
+    zeroInflation = fit_dict["conditions"]["zeroInflation"]
+    if zeroInflation:
+        zero_mass = step_pars.iloc[-1]
+        step_pars.drop(step_pars.index[-1], inplace=True)
 
-    with cv.localconverter(robjs.default_converter + pandas2ri.converter):
-        states = pd.Series(moveHMM.viterbi(x))
+    states = pd.Series(moveHMM.viterbi(x))
 
     states_w = (states.value_counts(ascending=True).sort_index() /
                 states.shape[0])
@@ -189,8 +213,8 @@ def plot_fit_hist(x, state_labels, **kwargs):
     # Weighted by the proportion of each state in the Viterbi states
     # sequence
     for state_idx in np.arange(n_states):
-        if fit_dict["conditions"]["zeroInflation"][0]:
-            step_denss[:, state_idx] *= ((1 - zero_mass[state_idx]) *
+        if zeroInflation:
+            step_denss[:, state_idx] *= ((1 - zero_mass.iloc[state_idx]) *
                                          states_w.iloc[state_idx])
         else:
             step_denss[:, state_idx] *= states_w.iloc[state_idx]
@@ -200,7 +224,7 @@ def plot_fit_hist(x, state_labels, **kwargs):
     # Weighted by the proportion of each state in the Viterbi states
     # sequence
     for state_idx in np.arange(n_states):
-        if fit_dict["conditions"]["zeroInflation"][0]:
+        if zeroInflation:
             angle_denss[:, state_idx] *= ((1 - zero_mass[state_idx]) *
                                           states_w.iloc[state_idx])
         else:
@@ -413,8 +437,7 @@ def _gamma(beta, covariates, n_states):
     ndarray
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           numpy2ri.converter):
+    with cv.localconverter(robjs.default_converter + numpy2ri.converter):
         gamma = np.array(moveHMM.trMatrix_rcpp(n_states, beta,
                                                covariates))
 
@@ -495,8 +518,7 @@ def viterbi(x):
       Integer sequence of states
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           numpy2ri.converter):
+    with cv.localconverter(robjs.default_converter + numpy2ri.converter):
         states = np.array(moveHMM.viterbi(x), int)
 
     return states
@@ -515,8 +537,7 @@ def state_probs(x):
     ndarray
 
     """
-    with cv.localconverter(robjs.default_converter +
-                           numpy2ri.converter):
+    with cv.localconverter(robjs.default_converter + numpy2ri.converter):
         states = np.array(moveHMM.stateProbs(x))
 
     return states
@@ -581,8 +602,7 @@ def sim_movement(n_ids=1, n_states=2, step_distr="gamma", angle_distr="vm",
     none_converter = cv.Converter("None converter")
     none_converter.py2rpy.register(type(None), _none2null)
 
-    with cv.localconverter(robjs.default_converter +
-                           pandas2ri.converter +
+    with cv.localconverter(robjs.default_converter + pandas2ri.converter +
                            none_converter):
         sim_df = moveHMM.simData(nbAnimals=n_ids, nbStates=n_states,
                                  stepDist=step_distr, angleDist=angle_distr,
@@ -679,7 +699,6 @@ if __name__ == '__main__':
         colrs = [colors[k] for k in states[:i] - 1]
         markers.set_color(colrs)
         return line, markers
-
 
     anim = FuncAnimation(fig, update_anim, frames=sim_df.shape[0] - 1,
                          interval=10, blit=False)
